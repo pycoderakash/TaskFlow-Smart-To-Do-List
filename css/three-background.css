@@ -1,0 +1,45 @@
+/* ==========================================================================
+   TaskFlow — Floating Productivity Workspace 3D Background Stylesheet
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   1. 3D WebGL Canvas Container
+   -------------------------------------------------------------------------- */
+.three-bg-container {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none; /* Crucial: clicks, touches, and scrolls pass directly to TaskFlow */
+  background: radial-gradient(ellipse at 50% 30%, #5d83a5 0%, #466785 55%, #2c455d 100%);
+  transition: opacity 0.4s ease;
+}
+
+.three-bg-container canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100% !important;
+  height: 100% !important;
+  display: block;
+  pointer-events: none;
+}
+
+/* --------------------------------------------------------------------------
+   2. Resilient Static Background Fallback (WebGL Unsupported / Failed)
+   -------------------------------------------------------------------------- */
+.three-bg-container.fallback-active {
+  background: url('../assets/workspace-bg.webp') center center / cover no-repeat;
+}
+
+/* --------------------------------------------------------------------------
+   3. Accessibility & prefers-reduced-motion
+   -------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  .three-bg-container {
+    transition: none;
+  }
+}
