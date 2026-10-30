@@ -25,12 +25,19 @@
 const STORAGE_KEY = 'taskflow_tasks';
 
 /**
+ * Supported time window for undoing task deletion (milliseconds)
+ */
+const UNDO_DURATION_MS = 6000;
+
+/**
  * Task Data Model:
  * @typedef {Object} Task
  * @property {string} id - Collision-resistant unique identifier
  * @property {string} title - Non-empty trimmed string
  * @property {boolean} completed - Task completion boolean flag
  * @property {number} createdAt - Valid unix timestamp (milliseconds)
+ * @property {'high'|'medium'|'low'} priority - Task priority level (default: 'medium')
+ * @property {string|null} dueDate - ISO date string 'YYYY-MM-DD' or null
  */
 
 /**
@@ -39,8 +46,14 @@ const STORAGE_KEY = 'taskflow_tasks';
 const AppState = {
   tasks: [],              // Authoritative in-memory tasks array (Single Source of Truth)
   filter: 'all',          // 'all' | 'active' | 'completed'
+  searchQuery: '',        // string - case-insensitive task title search query
+  sortBy: 'newest',       // 'newest' | 'oldest' | 'priority-desc' | 'due-asc'
   editingTaskId: null,    // string | null
+  undoStack: [],          // Array<{ task: Task, originalIndex: number }> - LIFO undo stack
 };
+
+// Global timer reference for pending undo opportunity
+let undoTimeoutId = null;
 
 // Cached DOM element references
 const DOM = {};
@@ -121,23 +134,88 @@ function clearStorageAlert() {
 }
 
 /**
- * Retrieves the subset of tasks corresponding to the active filter without mutating state
- * @returns {Array<Task>} Filtered list of tasks
+ * Priority weighting lookup: High=3, Medium=2, Low=1
+ */
+const PRIORITY_WEIGHTS = {
+  high: 3,
+  medium: 2,
+  low: 1
+};
+
+/**
+ * Retrieves the subset of tasks corresponding to the active status filter and search query,
+ * ordered according to the active sorting criteria.
+ *
+ * NOTE: Never mutates the authoritative AppState.tasks array. Operates on a copied subset.
+ *
+ * Consistent placement rule for tasks without a due date under 'due-asc':
+ * Tasks with deadlines are sorted in ascending chronological order (earliest deadline first).
+ * Tasks without a deadline (dueDate === null) are placed at the end of the list,
+ * sub-sorted by creation timestamp descending (newest first).
+ *
+ * @returns {Array<Task>} Filtered, searched, and sorted list of tasks
  */
 function getFilteredTasks() {
+  // 1. Status Filter Projection (All, Active, Completed)
+  let result;
   switch (AppState.filter) {
     case 'active':
-      return AppState.tasks.filter(task => !task.completed);
+      result = AppState.tasks.filter(task => !task.completed);
+      break;
     case 'completed':
-      return AppState.tasks.filter(task => task.completed);
+      result = AppState.tasks.filter(task => task.completed);
+      break;
     case 'all':
     default:
-      return AppState.tasks;
+      result = AppState.tasks.slice();
+      break;
   }
+
+  // 2. Case-Insensitive Search by Task Title with Trimmed Surrounding Whitespace
+  const trimmedQuery = AppState.searchQuery ? AppState.searchQuery.trim().toLowerCase() : '';
+  if (trimmedQuery) {
+    result = result.filter(task => task.title.toLowerCase().includes(trimmedQuery));
+  }
+
+  // 3. Sorting Execution on Copied Array (Without mutating authoritative AppState.tasks)
+  result.sort((a, b) => {
+    switch (AppState.sortBy) {
+      case 'oldest':
+        return a.createdAt - b.createdAt;
+
+      case 'priority-desc': {
+        const weightA = PRIORITY_WEIGHTS[a.priority] || 2;
+        const weightB = PRIORITY_WEIGHTS[b.priority] || 2;
+        const diff = weightB - weightA;
+        if (diff !== 0) return diff;
+        // Secondary tie-breaker: newest first
+        return b.createdAt - a.createdAt;
+      }
+
+      case 'due-asc': {
+        // Documented rule: Tasks with due dates appear first in chronological order (earliest first).
+        // Tasks without a due date are placed at the end, sub-sorted newest first.
+        if (a.dueDate && b.dueDate) {
+          if (a.dueDate < b.dueDate) return -1;
+          if (a.dueDate > b.dueDate) return 1;
+          return b.createdAt - a.createdAt;
+        }
+        if (a.dueDate && !b.dueDate) return -1;
+        if (!a.dueDate && b.dueDate) return 1;
+        return b.createdAt - a.createdAt;
+      }
+
+      case 'newest':
+      default:
+        return b.createdAt - a.createdAt;
+    }
+  });
+
+  return result;
 }
 
 /**
- * Recalculates and updates the task summary metrics in the DOM from authoritative state
+ * Recalculates and updates the task summary metrics and progress indicator in the DOM
  */
 function updateTaskStats() {
   const total = AppState.tasks.length;
@@ -147,14 +225,161 @@ function updateTaskStats() {
   if (DOM.totalTasksCount) DOM.totalTasksCount.textContent = String(total);
   if (DOM.activeTasksCount) DOM.activeTasksCount.textContent = String(active);
   if (DOM.completedTasksCount) DOM.completedTasksCount.textContent = String(completed);
+
+  // Completion Progress Calculation:
+  // progress = totalTasks === 0 ? 0 : (completedTasks / totalTasks) * 100
+  const progress = total === 0 ? 0 : (completed / total) * 100;
+  const roundedProgress = Math.round(progress);
+
+  if (DOM.progressText) {
+    DOM.progressText.textContent = `${completed} of ${total} tasks completed`;
+  }
+  if (DOM.progressPercent) {
+    DOM.progressPercent.textContent = `${roundedProgress}%`;
+  }
+  if (DOM.progressBar) {
+    DOM.progressBar.setAttribute('aria-valuenow', String(roundedProgress));
+    DOM.progressBar.setAttribute('aria-valuetext', `${roundedProgress}% completed`);
+  }
+  if (DOM.progressBarFill) {
+    DOM.progressBarFill.style.width = `${roundedProgress}%`;
+  }
 }
 
 /* ==========================================================================
    3. Persistent Storage Layer (window.localStorage)
    ========================================================================== */
 
+const VALID_PRIORITIES = ['high', 'medium', 'low'];
+
+/**
+ * Validates and sanitizes a priority value
+ * @param {unknown} val - Candidate priority string
+ * @returns {'high'|'medium'|'low'} Sanitized priority level
+ */
+function sanitizePriority(val) {
+  if (typeof val === 'string') {
+    const lower = val.trim().toLowerCase();
+    if (VALID_PRIORITIES.includes(lower)) {
+      return lower;
+    }
+  }
+  return 'medium';
+}
+
+/**
+ * Validates and sanitizes a date-only string in YYYY-MM-DD format
+ * Validates actual calendar correctness to prevent invalid dates like 2026-02-31
+ * @param {unknown} val - Candidate due date
+ * @returns {string|null} Validated YYYY-MM-DD string or null
+ */
+function sanitizeDueDate(val) {
+  if (!val || typeof val !== 'string') return null;
+  const trimmed = val.trim();
+  if (!trimmed) return null;
+
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+  if (!match) return null;
+
+  const y = parseInt(match[1], 10);
+  const m = parseInt(match[2], 10);
+  const d = parseInt(match[3], 10);
+
+  if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+
+  const dt = new Date(y, m - 1, d);
+  if (dt.getFullYear() !== y || dt.getMonth() !== m - 1 || dt.getDate() !== d) {
+    return null;
+  }
+
+  return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+}
+
+/**
+ * Returns today's local calendar date as a YYYY-MM-DD string
+ * Uses local getters to avoid timezone offset conversion errors
+ * @param {Date} [dateObj=new Date()] - Reference date
+ * @returns {string} Local date string
+ */
+function getLocalDateString(dateObj = new Date()) {
+  const y = dateObj.getFullYear();
+  const m = String(dateObj.getMonth() + 1).padStart(2, '0');
+  const d = String(dateObj.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/**
+ * Formats calendar date parts into a human-readable string (e.g. 'Oct 30, 2026')
+ * Uses local parts to guarantee zero timezone offset distortion
+ * @param {number} year - Year (YYYY)
+ * @param {number} month - Month (1-12)
+ * @param {number} day - Day of month (1-31)
+ * @returns {string} Formatted readable date
+ */
+function formatReadableDate(year, month, day) {
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return `${months[month - 1]} ${day}, ${year}`;
+}
+
+/**
+ * Calculates due date metadata and status classification:
+ * - 'completed': For completed tasks (completed tasks are never labeled overdue)
+ * - 'overdue': For past uncompleted deadlines
+ * - 'today': For deadlines falling on today's local calendar date
+ * - 'upcoming': For future deadlines
+ * @param {string|null} dueDate - Validated YYYY-MM-DD string
+ * @param {boolean} completed - Task completion flag
+ * @returns {{ status: 'completed'|'overdue'|'today'|'upcoming', badgeText: string, accessibleLabel: string, formattedDate: string }|null}
+ */
+function getDueDateInfo(dueDate, completed) {
+  const sanitized = sanitizeDueDate(dueDate);
+  if (!sanitized) return null;
+
+  const [yStr, mStr, dStr] = sanitized.split('-');
+  const y = parseInt(yStr, 10);
+  const m = parseInt(mStr, 10);
+  const d = parseInt(dStr, 10);
+  const formatted = formatReadableDate(y, m, d);
+  const todayStr = getLocalDateString();
+
+  if (completed) {
+    return {
+      status: 'completed',
+      badgeText: `Done · ${formatted}`,
+      accessibleLabel: `Completed (Deadline was ${formatted})`,
+      formattedDate: formatted
+    };
+  }
+
+  if (sanitized < todayStr) {
+    return {
+      status: 'overdue',
+      badgeText: `Overdue · ${formatted}`,
+      accessibleLabel: `Overdue: deadline was ${formatted}`,
+      formattedDate: formatted
+    };
+  }
+
+  if (sanitized === todayStr) {
+    return {
+      status: 'today',
+      badgeText: `Due today · ${formatted}`,
+      accessibleLabel: `Due today: ${formatted}`,
+      formattedDate: formatted
+    };
+  }
+
+  return {
+    status: 'upcoming',
+    badgeText: `Due · ${formatted}`,
+    accessibleLabel: `Upcoming deadline: ${formatted}`,
+    formattedDate: formatted
+  };
+}
+
 /**
  * Validates and sanitizes an individual task candidate from untrusted storage
+ * Assigns safe defaults for older records without priority or due date
  * @param {unknown} item - Untrusted candidate record
  * @returns {Task|null} Sanitized Task object or null if record fails validation
  */
@@ -188,11 +413,19 @@ function validateAndSanitizeTask(item) {
     createdAt = Date.now();
   }
 
+  // 5. Validate Priority: 'high' | 'medium' | 'low' (defaults to 'medium' for legacy tasks)
+  const priority = sanitizePriority(item.priority);
+
+  // 6. Validate DueDate: 'YYYY-MM-DD' or null (defaults to null for legacy tasks)
+  const dueDate = sanitizeDueDate(item.dueDate);
+
   return {
     id: item.id.trim(),
     title: trimmedTitle,
     completed: item.completed,
     createdAt: createdAt,
+    priority: priority,
+    dueDate: dueDate,
   };
 }
 
@@ -308,9 +541,11 @@ function saveTasks() {
 /**
  * Creates a new task, persists to storage, and re-renders preserving active filter
  * @param {string} rawTitle - Raw user input title
+ * @param {string} [rawPriority='medium'] - Priority level ('high' | 'medium' | 'low')
+ * @param {string|null} [rawDueDate=null] - Due date string ('YYYY-MM-DD' or null)
  * @returns {Task|null} Created task or null if invalid
  */
-function createTask(rawTitle) {
+function createTask(rawTitle, rawPriority = 'medium', rawDueDate = null) {
   const trimmed = rawTitle ? rawTitle.trim() : '';
   if (!trimmed) {
     showInputError('Please enter a task title. Empty tasks cannot be added.');
@@ -322,6 +557,8 @@ function createTask(rawTitle) {
     title: trimmed,
     completed: false,
     createdAt: Date.now(),
+    priority: sanitizePriority(rawPriority),
+    dueDate: sanitizeDueDate(rawDueDate),
   };
 
   // Add new tasks to the beginning of the authoritative array
@@ -331,7 +568,7 @@ function createTask(rawTitle) {
   saveTasks();
 
   clearInputError();
-  announceStatus(`Task "${trimmed}" added.`);
+  announceStatus(`Task "${trimmed}" added with ${newTask.priority} priority.`);
   render();
   return newTask;
 }
@@ -406,12 +643,14 @@ function restoreTaskFocus(taskId) {
 }
 
 /**
- * Saves changes to an existing task title, saves to storage, and re-renders
+ * Saves changes to an existing task title, priority, and due date, saves to storage, and re-renders
  * @param {string} taskId - Target task ID
  * @param {string} newTitle - New title string
+ * @param {string} [newPriority] - Optional updated priority ('high' | 'medium' | 'low')
+ * @param {string|null} [newDueDate] - Optional updated due date ('YYYY-MM-DD' or null)
  * @returns {boolean} Whether the update succeeded
  */
-function saveTaskEdit(taskId, newTitle) {
+function saveTaskEdit(taskId, newTitle, newPriority, newDueDate) {
   const task = AppState.tasks.find(t => t.id === taskId);
   if (!task) return false;
 
@@ -421,8 +660,13 @@ function saveTaskEdit(taskId, newTitle) {
     return false;
   }
 
-  const hasChanged = task.title !== trimmed;
+  const priorityToSave = newPriority !== undefined ? sanitizePriority(newPriority) : task.priority;
+  const dueDateToSave = newDueDate !== undefined ? sanitizeDueDate(newDueDate) : task.dueDate;
+
+  const hasChanged = task.title !== trimmed || task.priority !== priorityToSave || task.dueDate !== dueDateToSave;
   task.title = trimmed;
+  task.priority = priorityToSave;
+  task.dueDate = dueDateToSave;
   AppState.editingTaskId = null;
 
   // Persist only if state actually changed
@@ -453,7 +697,7 @@ function cancelTaskEdit() {
 }
 
 /**
- * Deletes a single task, saves to storage, and re-renders
+ * Deletes a single task, saves to storage, and activates an Undo opportunity
  * @param {string} taskId - Target task ID
  */
 function deleteTask(taskId) {
@@ -469,8 +713,109 @@ function deleteTask(taskId) {
   // Persist state change
   saveTasks();
 
-  announceStatus(`Task "${removedTask.title}" deleted.`);
+  // Push to Undo stack (supporting multiple rapid deletions via LIFO)
+  AppState.undoStack.push({ task: removedTask, originalIndex: taskIndex });
+
+  // Reset any pending undo expiration timer
+  if (undoTimeoutId) {
+    clearTimeout(undoTimeoutId);
+    undoTimeoutId = null;
+  }
+
+  // Display Undo Toast notification
+  if (DOM.undoToast && DOM.undoMessage) {
+    DOM.undoMessage.textContent = `Task "${removedTask.title}" deleted.`;
+    DOM.undoToast.hidden = false;
+    DOM.undoToast.classList.add('visible');
+  }
+
+  // Start new timer for undo window
+  undoTimeoutId = setTimeout(() => {
+    handleUndoExpired();
+  }, UNDO_DURATION_MS);
+
+  announceStatus(`Task "${removedTask.title}" deleted. Select Undo to restore.`);
   render();
+}
+
+/**
+ * Restores the most recently deleted task from the undo stack (LIFO)
+ * @returns {Task|null} Restored task record or null if no active undo
+ */
+function undoDelete() {
+  if (!AppState.undoStack || AppState.undoStack.length === 0) return null;
+
+  // Cancel pending timeout
+  if (undoTimeoutId) {
+    clearTimeout(undoTimeoutId);
+    undoTimeoutId = null;
+  }
+
+  const { task, originalIndex } = AppState.undoStack.pop();
+
+  // Restore into authoritative tasks array at original index (clamped safely)
+  const insertIndex = Math.min(Math.max(0, originalIndex), AppState.tasks.length);
+  AppState.tasks.splice(insertIndex, 0, task);
+
+  // Persist restored state immediately
+  saveTasks();
+
+  announceStatus(`Task "${task.title}" restored.`);
+
+  // If previous rapid deletions remain on the stack, show the next item
+  if (AppState.undoStack.length > 0) {
+    const nextItem = AppState.undoStack[AppState.undoStack.length - 1];
+    if (DOM.undoMessage) {
+      DOM.undoMessage.textContent = `Task "${nextItem.task.title}" deleted.`;
+    }
+    undoTimeoutId = setTimeout(() => {
+      handleUndoExpired();
+    }, UNDO_DURATION_MS);
+  } else {
+    hideUndoToast();
+  }
+
+  render();
+  return task;
+}
+
+/**
+ * Handles expiration of the undo opportunity
+ */
+function handleUndoExpired() {
+  if (undoTimeoutId) {
+    clearTimeout(undoTimeoutId);
+    undoTimeoutId = null;
+  }
+  if (AppState.undoStack && AppState.undoStack.length > 0) {
+    AppState.undoStack = [];
+    announceStatus('Undo opportunity expired.');
+  }
+  hideUndoToast();
+}
+
+/**
+ * Dismisses the undo notification explicitly
+ */
+function handleUndoDismiss() {
+  if (undoTimeoutId) {
+    clearTimeout(undoTimeoutId);
+    undoTimeoutId = null;
+  }
+  if (AppState.undoStack) {
+    AppState.undoStack = [];
+  }
+  hideUndoToast();
+}
+
+/**
+ * Hides the undo toast element
+ */
+function hideUndoToast() {
+  if (DOM.undoToast) {
+    DOM.undoToast.classList.remove('visible');
+    DOM.undoToast.hidden = true;
+  }
 }
 
 /**
@@ -498,6 +843,251 @@ function setFilter(filterName) {
 
   announceStatus(`Viewing ${filterName} tasks.`);
   render();
+}
+
+/**
+ * Sets the active search query and re-renders visible tasks without mutating state
+ * @param {string} query - Search term
+ */
+function setSearchQuery(query) {
+  AppState.searchQuery = typeof query === 'string' ? query : '';
+  if (DOM.taskSearch && DOM.taskSearch.value !== AppState.searchQuery) {
+    DOM.taskSearch.value = AppState.searchQuery;
+  }
+  if (DOM.searchClearBtn) {
+    DOM.searchClearBtn.hidden = !AppState.searchQuery.trim();
+  }
+  render();
+}
+
+/**
+ * Sets the active sort criteria and re-renders visible tasks without mutating state
+ * @param {'newest'|'oldest'|'priority-desc'|'due-asc'} sortBy - Sort option
+ */
+function setSortBy(sortBy) {
+  const validSorts = ['newest', 'oldest', 'priority-desc', 'due-asc'];
+  if (!validSorts.includes(sortBy)) return;
+
+  AppState.sortBy = sortBy;
+  if (DOM.sortSelect && DOM.sortSelect.value !== sortBy) {
+    DOM.sortSelect.value = sortBy;
+  }
+  const sortLabels = {
+    'newest': 'Newest first',
+    'oldest': 'Oldest first',
+    'priority-desc': 'Priority: High to Low',
+    'due-asc': 'Due date: Earliest first'
+  };
+  announceStatus(`Sorted tasks by ${sortLabels[sortBy] || sortBy}.`);
+  render();
+}
+
+/* ==========================================================================
+   4.5. Backup & Data Management (JSON Export & Import)
+   ========================================================================== */
+
+/**
+ * Displays a temporary alert in the backup card
+ * @param {string} message - Notice or error string
+ * @param {'info'|'success'|'error'} [type='info'] - Style type
+ */
+function showBackupAlert(message, type = 'info') {
+  if (DOM.backupAlert) {
+    DOM.backupAlert.textContent = message;
+    DOM.backupAlert.className = `backup-alert backup-alert-${type}`;
+    DOM.backupAlert.hidden = false;
+    setTimeout(() => {
+      if (DOM.backupAlert && DOM.backupAlert.textContent === message) {
+        DOM.backupAlert.hidden = true;
+      }
+    }, 6000);
+  }
+  announceStatus(message);
+}
+
+/**
+ * Serializes the authoritative task collection to formatted, readable JSON
+ * @returns {string} Formatted JSON string
+ */
+function exportTasksJSON() {
+  return JSON.stringify(AppState.tasks, null, 2);
+}
+
+/**
+ * Handles client-side file download of taskflow-backup.json
+ * @returns {string} Serialized JSON
+ */
+function handleExportTasks() {
+  const jsonString = exportTasksJSON();
+
+  if (typeof Blob !== 'undefined' && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+    try {
+      const blob = new Blob([jsonString], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'taskflow-backup.json';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('TaskFlow: Error initiating download:', err);
+    }
+  }
+
+  const count = AppState.tasks.length;
+  const msg = count === 0
+    ? 'Exported empty collection (0 tasks) to taskflow-backup.json.'
+    : `Exported ${count} task(s) to taskflow-backup.json.`;
+
+  showBackupAlert(msg, 'success');
+  return jsonString;
+}
+
+/**
+ * Imports tasks from a JSON string with validation, sanitization, and duplicate resolution
+ * @param {string} jsonString - Uploaded JSON string
+ * @param {'merge'|'replace'} [mode='merge'] - Import mode ('merge' or 'replace')
+ * @param {() => boolean} [confirmFn] - Optional confirmation function for 'replace' mode
+ * @returns {{ success: boolean, importedCount: number, error?: string, discardedCount?: number }}
+ */
+function importTasksJSON(jsonString, mode = 'merge', confirmFn = null) {
+  if (typeof jsonString !== 'string' || !jsonString.trim()) {
+    const errorMsg = 'Failed to import: File is empty or content is invalid.';
+    showBackupAlert(errorMsg, 'error');
+    return { success: false, importedCount: 0, error: errorMsg };
+  }
+
+  // 1. JSON Syntax Validation
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonString);
+  } catch (err) {
+    const errorMsg = 'Failed to parse JSON: File contains malformed syntax.';
+    showBackupAlert(errorMsg, 'error');
+    return { success: false, importedCount: 0, error: errorMsg };
+  }
+
+  // 2. Top-Level Schema Validation: Array or Object with .tasks Array
+  let rawList = null;
+  if (Array.isArray(parsed)) {
+    rawList = parsed;
+  } else if (parsed && typeof parsed === 'object' && Array.isArray(parsed.tasks)) {
+    rawList = parsed.tasks;
+  } else {
+    const errorMsg = 'Invalid schema: Uploaded file must contain a list of tasks.';
+    showBackupAlert(errorMsg, 'error');
+    return { success: false, importedCount: 0, error: errorMsg };
+  }
+
+  // 3. Record Validation & Sanitization
+  const validTasks = [];
+  const importedSeenIds = new Set();
+  let discardedCount = 0;
+
+  for (const candidate of rawList) {
+    const sanitized = validateAndSanitizeTask(candidate);
+    if (sanitized) {
+      // Resolve duplicate IDs within the imported file itself
+      if (importedSeenIds.has(sanitized.id)) {
+        sanitized.id = generateId();
+      }
+      importedSeenIds.add(sanitized.id);
+      validTasks.push(sanitized);
+    } else {
+      discardedCount++;
+    }
+  }
+
+  // If the file was non-empty but contained 0 valid tasks
+  if (rawList.length > 0 && validTasks.length === 0) {
+    const errorMsg = 'Import rejected: No valid task records found in the file.';
+    showBackupAlert(errorMsg, 'error');
+    return { success: false, importedCount: 0, error: errorMsg };
+  }
+
+  // 4. Execution of Replace vs. Merge
+  if (mode === 'replace') {
+    const shouldProceed = typeof confirmFn === 'function'
+      ? confirmFn()
+      : (typeof window !== 'undefined' && typeof window.confirm === 'function'
+          ? window.confirm('Replacing your tasks will overwrite all existing tasks with the imported backup. Do you want to proceed?')
+          : true);
+
+    if (!shouldProceed) {
+      const cancelMsg = 'Replacement cancelled. Existing tasks were preserved.';
+      announceStatus(cancelMsg);
+      showBackupAlert(cancelMsg, 'info');
+      return { success: false, importedCount: 0, error: 'Cancelled by user' };
+    }
+
+    // Overwrite state
+    AppState.tasks = validTasks;
+    AppState.editingTaskId = null;
+  } else {
+    // Merge mode: resolve duplicate IDs against existing tasks
+    const existingIds = new Set(AppState.tasks.map(t => t.id));
+    for (const task of validTasks) {
+      if (existingIds.has(task.id)) {
+        task.id = generateId();
+      }
+      existingIds.add(task.id);
+    }
+
+    // Prepend imported tasks
+    AppState.tasks = validTasks.concat(AppState.tasks);
+  }
+
+  // 5. Persist, render, and notify
+  saveTasks();
+  render();
+
+  let successMsg = `Successfully imported ${validTasks.length} task(s)`;
+  if (mode === 'replace') {
+    successMsg += ' (replaced existing tasks).';
+  } else {
+    successMsg += ' (merged with existing tasks).';
+  }
+  if (discardedCount > 0) {
+    successMsg += ` Discarded ${discardedCount} invalid record(s).`;
+  }
+
+  showBackupAlert(successMsg, 'success');
+  return {
+    success: true,
+    importedCount: validTasks.length,
+    discardedCount: discardedCount
+  };
+}
+
+/**
+ * Handles file input change event from DOM
+ * @param {Event} e - Input change event
+ */
+function handleImportChange(e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+
+  const mode = DOM.importModeSelect ? DOM.importModeSelect.value : 'merge';
+  const reader = new FileReader();
+
+  reader.onload = (event) => {
+    const content = event.target.result;
+    importTasksJSON(content, mode);
+    if (DOM.importFileInput) {
+      DOM.importFileInput.value = '';
+    }
+  };
+
+  reader.onerror = () => {
+    showBackupAlert('Failed to read the file from disk.', 'error');
+    if (DOM.importFileInput) {
+      DOM.importFileInput.value = '';
+    }
+  };
+
+  reader.readAsText(file);
 }
 
 /* ==========================================================================
@@ -540,6 +1130,28 @@ function createTaskElement(task, isEditing) {
     editInput.required = true;
     editInput.autocomplete = 'off';
 
+    // Priority selector in edit mode
+    const editPriority = document.createElement('select');
+    editPriority.className = 'task-edit-priority';
+    editPriority.setAttribute('aria-label', `Edit priority for ${task.title}`);
+    ['low', 'medium', 'high'].forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p;
+      opt.textContent = p.charAt(0).toUpperCase() + p.slice(1);
+      if (p === task.priority) {
+        opt.selected = true;
+      }
+      editPriority.appendChild(opt);
+    });
+    editPriority.value = task.priority;
+
+    // Due date input in edit mode
+    const editDueDate = document.createElement('input');
+    editDueDate.type = 'date';
+    editDueDate.className = 'task-edit-due-date';
+    editDueDate.value = task.dueDate || '';
+    editDueDate.setAttribute('aria-label', `Edit due date for ${task.title}`);
+
     const actionsContainer = document.createElement('div');
     actionsContainer.className = 'task-actions';
 
@@ -571,6 +1183,8 @@ function createTaskElement(task, isEditing) {
     actionsContainer.appendChild(cancelBtn);
 
     editForm.appendChild(editInput);
+    editForm.appendChild(editPriority);
+    editForm.appendChild(editDueDate);
     editForm.appendChild(actionsContainer);
     li.appendChild(editForm);
 
@@ -595,13 +1209,47 @@ function createTaskElement(task, isEditing) {
 
   checkboxLabel.appendChild(checkbox);
 
+  // Task Details Wrapper (Title + Meta Badges)
+  const detailsContainer = document.createElement('div');
+  detailsContainer.className = 'task-details';
+
   // Safe Text Container
   const titleSpan = document.createElement('span');
   titleSpan.className = 'task-text';
   titleSpan.textContent = task.title; // Safe textContent to prevent HTML/XSS injection
+  detailsContainer.appendChild(titleSpan);
+
+  // Meta Badges Container (Priority Badge & Due Date Badge)
+  const badgesContainer = document.createElement('div');
+  badgesContainer.className = 'task-badges';
+
+  // 1. Priority Badge
+  const priorityBadge = document.createElement('span');
+  priorityBadge.className = `task-badge priority-badge priority-${task.priority}`;
+  priorityBadge.dataset.priority = task.priority;
+  priorityBadge.setAttribute('role', 'status');
+  priorityBadge.setAttribute('aria-label', `Priority: ${task.priority}`);
+  priorityBadge.textContent = task.priority.charAt(0).toUpperCase() + task.priority.slice(1);
+  badgesContainer.appendChild(priorityBadge);
+
+  // 2. Due Date Badge (if present)
+  if (task.dueDate) {
+    const dueInfo = getDueDateInfo(task.dueDate, task.completed);
+    if (dueInfo) {
+      const dueBadge = document.createElement('span');
+      dueBadge.className = `task-badge due-badge due-${dueInfo.status}`;
+      dueBadge.dataset.dueStatus = dueInfo.status;
+      dueBadge.setAttribute('role', 'status');
+      dueBadge.setAttribute('aria-label', dueInfo.accessibleLabel);
+      dueBadge.textContent = dueInfo.badgeText;
+      badgesContainer.appendChild(dueBadge);
+    }
+  }
+
+  detailsContainer.appendChild(badgesContainer);
 
   mainRegion.appendChild(checkboxLabel);
-  mainRegion.appendChild(titleSpan);
+  mainRegion.appendChild(detailsContainer);
 
   // Task Actions (Edit & Delete buttons with nested label spans)
   const actionsContainer = document.createElement('div');
@@ -658,7 +1306,10 @@ function render() {
 
       const messageElem = DOM.emptyState.querySelector('.empty-state-message');
       if (messageElem) {
-        if (AppState.tasks.length === 0) {
+        const trimmedQuery = AppState.searchQuery ? AppState.searchQuery.trim() : '';
+        if (trimmedQuery) {
+          messageElem.textContent = `No tasks match "${trimmedQuery}". Try another search term or clear the search.`;
+        } else if (AppState.tasks.length === 0) {
           messageElem.textContent = 'No tasks found. Add a task above to get started!';
         } else if (AppState.filter === 'active') {
           messageElem.textContent = 'No active tasks found. Great job!';
@@ -712,10 +1363,15 @@ function handleTaskFormSubmit(e) {
   if (!DOM.taskInput) return;
 
   const rawTitle = DOM.taskInput.value;
-  const created = createTask(rawTitle);
+  const rawPriority = DOM.taskPriority ? DOM.taskPriority.value : 'medium';
+  const rawDueDate = DOM.taskDueDate ? DOM.taskDueDate.value : null;
+
+  const created = createTask(rawTitle, rawPriority, rawDueDate);
 
   if (created) {
     DOM.taskInput.value = '';
+    if (DOM.taskPriority) DOM.taskPriority.value = 'medium';
+    if (DOM.taskDueDate) DOM.taskDueDate.value = '';
     DOM.taskInput.focus();
   } else {
     DOM.taskInput.focus();
@@ -750,8 +1406,12 @@ function handleTaskListClick(e) {
     e.stopPropagation();
     const editForm = actionTarget.closest('.task-edit-form');
     const input = editForm ? editForm.querySelector('.task-edit-input') : null;
+    const prioritySelect = editForm ? editForm.querySelector('.task-edit-priority') : null;
+    const dueDateInput = editForm ? editForm.querySelector('.task-edit-due-date') : null;
     if (input) {
-      const success = saveTaskEdit(taskId, input.value);
+      const priorityVal = prioritySelect ? prioritySelect.value : undefined;
+      const dueDateVal = dueDateInput ? dueDateInput.value : undefined;
+      const success = saveTaskEdit(taskId, input.value, priorityVal, dueDateVal);
       if (!success) {
         input.classList.add('is-invalid');
         input.setAttribute('aria-invalid', 'true');
@@ -798,9 +1458,13 @@ function handleTaskListSubmit(e) {
   e.preventDefault();
   const taskId = editForm.dataset.taskId || editForm.closest('.task-item')?.dataset.taskId;
   const input = editForm.querySelector('.task-edit-input');
+  const prioritySelect = editForm.querySelector('.task-edit-priority');
+  const dueDateInput = editForm.querySelector('.task-edit-due-date');
   if (!input || !taskId) return;
 
-  const success = saveTaskEdit(taskId, input.value);
+  const priorityVal = prioritySelect ? prioritySelect.value : undefined;
+  const dueDateVal = dueDateInput ? dueDateInput.value : undefined;
+  const success = saveTaskEdit(taskId, input.value, priorityVal, dueDateVal);
   if (!success) {
     input.classList.add('is-invalid');
     input.setAttribute('aria-invalid', 'true');
@@ -871,14 +1535,39 @@ function initApp() {
   DOM.storageAlert = document.getElementById('storage-alert');
   DOM.taskForm = document.getElementById('task-form');
   DOM.taskInput = document.getElementById('task-input');
+  DOM.taskPriority = document.getElementById('task-priority');
+  DOM.taskDueDate = document.getElementById('task-due-date');
   DOM.inputError = document.getElementById('input-error');
 
   DOM.totalTasksCount = document.getElementById('total-tasks-count');
   DOM.activeTasksCount = document.getElementById('active-tasks-count');
   DOM.completedTasksCount = document.getElementById('completed-tasks-count');
 
+  // Progress indicator references
+  DOM.progressText = document.getElementById('progress-text');
+  DOM.progressPercent = document.getElementById('progress-percent');
+  DOM.progressBar = document.getElementById('progress-bar');
+  DOM.progressBarFill = document.getElementById('progress-bar-fill');
+
   DOM.filterGroup = document.querySelector('.filter-group');
   DOM.filterButtons = document.querySelectorAll('.filter-btn');
+
+  DOM.taskSearch = document.getElementById('task-search');
+  DOM.searchClearBtn = document.getElementById('search-clear-btn');
+  DOM.sortSelect = document.getElementById('sort-select');
+
+  // Undo delete notification references
+  DOM.undoToast = document.getElementById('undo-toast');
+  DOM.undoMessage = document.getElementById('undo-message');
+  DOM.undoBtn = document.getElementById('undo-btn');
+  DOM.undoDismissBtn = document.getElementById('undo-dismiss-btn');
+
+  // Backup & Data management references
+  DOM.exportBtn = document.getElementById('export-tasks-btn');
+  DOM.importModeSelect = document.getElementById('import-mode-select');
+  DOM.importFileInput = document.getElementById('import-file-input');
+  DOM.importFileLabel = document.getElementById('import-file-label');
+  DOM.backupAlert = document.getElementById('backup-alert');
 
   DOM.taskList = document.getElementById('task-list');
   DOM.emptyState = document.getElementById('empty-state');
@@ -887,7 +1576,15 @@ function initApp() {
   // 1. Restore state from localStorage
   AppState.tasks = loadTasks();
   AppState.filter = 'all';
+  AppState.searchQuery = '';
+  AppState.sortBy = 'newest';
   AppState.editingTaskId = null;
+  AppState.undoStack = [];
+
+  if (undoTimeoutId) {
+    clearTimeout(undoTimeoutId);
+    undoTimeoutId = null;
+  }
 
   // 2. Bind Form Listeners
   if (DOM.taskForm) {
@@ -908,7 +1605,79 @@ function initApp() {
     DOM.filterGroup.addEventListener('click', handleFilterGroupClick);
   }
 
-  // 4. Bind Delegated Event Handlers on Stable Task List Container
+  // 4. Bind Search and Sort Controls Listeners
+  if (DOM.taskSearch) {
+    DOM.taskSearch.addEventListener('input', (e) => {
+      AppState.searchQuery = e.target.value;
+      if (DOM.searchClearBtn) {
+        DOM.searchClearBtn.hidden = !e.target.value.trim();
+      }
+      render();
+    });
+
+    DOM.taskSearch.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && DOM.taskSearch.value) {
+        e.preventDefault();
+        DOM.taskSearch.value = '';
+        AppState.searchQuery = '';
+        if (DOM.searchClearBtn) DOM.searchClearBtn.hidden = true;
+        render();
+      }
+    });
+  }
+
+  if (DOM.searchClearBtn) {
+    DOM.searchClearBtn.addEventListener('click', () => {
+      if (DOM.taskSearch) {
+        DOM.taskSearch.value = '';
+        DOM.taskSearch.focus();
+      }
+      AppState.searchQuery = '';
+      DOM.searchClearBtn.hidden = true;
+      render();
+    });
+  }
+
+  if (DOM.sortSelect) {
+    DOM.sortSelect.addEventListener('change', (e) => {
+      setSortBy(e.target.value);
+    });
+  }
+
+  // 5. Bind Undo Notification Action Listeners
+  if (DOM.undoBtn) {
+    DOM.undoBtn.addEventListener('click', () => {
+      undoDelete();
+    });
+  }
+
+  if (DOM.undoDismissBtn) {
+    DOM.undoDismissBtn.addEventListener('click', () => {
+      handleUndoDismiss();
+    });
+  }
+
+  // 6. Bind Backup & Data Action Listeners (Export & Import)
+  if (DOM.exportBtn) {
+    DOM.exportBtn.addEventListener('click', () => {
+      handleExportTasks();
+    });
+  }
+
+  if (DOM.importFileInput) {
+    DOM.importFileInput.addEventListener('change', handleImportChange);
+  }
+
+  if (DOM.importFileLabel) {
+    DOM.importFileLabel.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        if (DOM.importFileInput) DOM.importFileInput.click();
+      }
+    });
+  }
+
+  // 7. Bind Delegated Event Handlers on Stable Task List Container
   if (DOM.taskList) {
     DOM.taskList.addEventListener('click', handleTaskListClick);
     DOM.taskList.addEventListener('change', handleTaskListChange);
@@ -917,7 +1686,7 @@ function initApp() {
     DOM.taskList.addEventListener('input', handleTaskListInput);
   }
 
-  // 5. Initial render of restored tasks and statistics
+  // 6. Initial render of restored tasks and statistics
   render();
 
   console.log(`TaskFlow: Advanced filtering & event delegation initialized. Loaded ${AppState.tasks.length} task(s).`);
